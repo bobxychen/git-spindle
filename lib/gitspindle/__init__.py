@@ -3,12 +3,20 @@ import docopt
 import os
 import re
 import shlex
+import six
 import sys
 import tempfile
+import time
 import whelk
+try:
+    import importlib.util
+except ImportError:
+    # No plugins for you...
+    importlib = None
 
 __all__ = ['GitSpindle', 'Credential', 'command', 'wants_parent']
 NO_VALUE_SENTINEL = 'NO_VALUE_SENTINEL'
+PLUGIN_PATH = os.path.join(os.path.expanduser('~'), '.local', 'lib', 'git-spindle')
 
 __builtins__['PY3'] = sys.version_info[0] > 2
 if PY3:
@@ -48,6 +56,61 @@ def no_login(fnc):
     fnc.no_login = True
     return fnc
 
+class DocoptExit(SystemExit):
+    help = ''
+    commands = {}
+    def __init__(self, message='', command=None):
+        if command and command in self.commands:
+            SystemExit.__init__(self, self.commands[command])
+        elif message:
+            SystemExit.__init__(self, message)
+        else:
+            SystemExit.__init__(self, self.help)
+docopt.DocoptExit = DocoptExit
+
+def extras(help, version, options, doc):
+    if not help or not any((o.name in ('-h', '--help')) and o.value for o in options):
+        return
+    for opt in options[1:]:
+        if isinstance(opt, docopt.Argument):
+            raise(DocoptExit(command=opt.value))
+    raise DocoptExit()
+
+docopt.extras = extras
+
+GitSpindlePlugin = None
+class GitSpindlePluginLoader(type):
+    def __new__(cls, name, parents, attrs):
+        if not importlib:
+            return super(GitSpindlePluginLoader, cls).__new__(cls, name, parents, attrs)
+        if GitSpindlePlugin in parents:
+            for attr in attrs:
+                if getattr(attrs[attr], 'is_command', False) :
+                    if attr in GitSpindlePluginLoader.currently_loading:
+                        print("%s is trying to override %s, ignoring" % (GitSpindlePluginLoader.current_plugin, attr))
+                    else:
+                        GitSpindlePluginLoader.currently_loading[attr] = attrs[attr]
+        else:
+            GitSpindlePluginLoader.currently_loading = attrs
+            path = os.path.join(PLUGIN_PATH, name.lower())
+            if os.path.exists(path):
+                for file in os.listdir(path):
+                    if file.endswith('.py'):
+                        spec = importlib.util.spec_from_file_location('temp_module', os.path.join(path, file))
+                        module = importlib.util.module_from_spec(spec)
+                        GitSpindlePluginLoader.current_plugin = file
+                        try:
+                            spec.loader.exec_module(module)
+                        except Exception as e:
+                            print("Failed to load plugin %s: %s" % (file, str(e)))
+
+            return super(GitSpindlePluginLoader, cls).__new__(cls, name, parents, attrs)
+
+@six.add_metaclass(GitSpindlePluginLoader)
+class GitSpindlePlugin(object):
+     pass
+
+@six.add_metaclass(GitSpindlePluginLoader)
 class GitSpindle(object):
 
     def __init__(self):
@@ -69,10 +132,11 @@ class GitSpindle(object):
         self.my_login = {}
         self.use_credential_helper = self.git('config', 'credential.helper').stdout.strip() not in ('', 'cache')
 
-        self.usage = """%s - %s integration for git
+        self.usage = DocoptExit.help = """%s - %s integration for git
 A full manual can be found on http://seveas.github.com/git-spindle/
 
 Usage:\n""" % (self.prog, self.what)
+        DocoptExit.help += "  %s [options] <command> [command-options]\n\nCommands:\n" % (self.prog)
         for name in sorted(dir(self)):
             fnc = getattr(self, name)
             if not getattr(fnc, 'is_command', False):
@@ -86,8 +150,11 @@ Usage:\n""" % (self.prog, self.what)
                 doc[0] = doc[0].replace('[--host=<host>] ', '')
             if doc[0]:
                 doc[0] = ' ' + doc[0]
-            self.usage += '%s:\n  %s %s %s%s\n' % (doc[1], self.prog, '[options]', name, doc[0])
-        self.usage += """
+            help = '%s:\n  %s %s %s%s\n' % (doc[1], self.prog, '[options]', name, doc[0])
+            self.usage += help
+            DocoptExit.commands[name] = help
+            DocoptExit.help += '  %-25s%s\n' % (name, doc[1])
+        tail = """
 Options:
   -h --help              Show this help message and exit
   --desc=<description>   Description for the new gist/repo
@@ -99,9 +166,11 @@ Options:
   --git                  Use git:// urls for cloning 3rd party repos
   --goblet               When mirroring, set up goblet configuration
   --account=<account>    Use another account than the default\n"""
+        self.usage += tail
+        DocoptExit.help += tail
 
     def gitm(self, *args, **kwargs):
-        """A git command thas must be succesfull"""
+        """A git command that must be successful"""
         result = self.git(*args, **kwargs)
         if not result:
             if result.stderr:
@@ -167,8 +236,10 @@ Options:
         # - Else we look at remotes
         #   - Do we recognize the host? No -> discard
         #   - Do we have an account? Is it on there? No -> discard
-        #   - Is it mine? Yes -> return it('s parent), No -> remember it
-        #   - Return the first rememered one(s parent)
+        #   - Is it owned by the current account? Yes -> return it('s parent), No -> remember it
+        # If we haven't found one owned by the current account:
+        #   - Do we have one named origin? Yes -> return it('s parent)
+        #   - Return the first remembered one('s parent)
         #  FIXME: errors should mention account if available
         remote = host = repo = None
         if opts['<repo>']:
@@ -180,17 +251,21 @@ Options:
             self.gitm('rev-parse')
         else:
             confremotes = self.git('config', '--get-regexp', 'remote\..*\.url').stdout.strip().splitlines()
-            first = None
+            first = origin = None
             for remote in confremotes:
                 remote, url = remote.split()
                 remote = remote.split('.')[1]
                 host, user, repo = self._parse_url(url)
                 if repo and not first:
                     first = remote, host, user, repo
+                if remote == 'origin':
+                    origin = remote, host, user, repo
                 if user == self.my_login:
                     break
             else:
-                if first:
+                if origin:
+                    remote, host, user, repo = origin
+                elif first:
                     remote, host, user, repo = first
 
         if hostname_only:
@@ -216,6 +291,30 @@ Options:
 
         return repo_
 
+    def wait_for_repo(self, user, repo_, opts):
+        warned = False
+        tries = 120/5
+        repo = None
+        while tries and not repo:
+            repo = self.get_repo('', user, repo_)
+            if repo:
+                res = self.git('ls-remote', self.clone_url(repo, opts))
+                if res:
+                    if warned:
+                        print("")
+                    return
+                repo = None
+            if not warned:
+                sys.stdout.write("Waiting for repository creation...")
+                warned = True
+            else:
+                sys.stdout.write('.')
+            sys.stdout.flush()
+            tries -= 1
+            time.sleep(5)
+        print("")
+        err("%s failed to create the %s/%s repository" % (self.what, user, repo))
+
     def question(self, question, default=True):
         yn = ['y/N', 'Y/n'][default or self.assume_yes]
         if self.assume_yes:
@@ -226,7 +325,16 @@ Options:
             return default
         return answer.lower() == 'y'
 
-    def edit_msg(self, msg, filename, split_title=True):
+    def edit_msg(self, title, body, extra, filename, split_title=True):
+        markdown = filename.endswith(('.md', '.MD'))
+        comment = '[//]: #' if markdown else '#'
+        if extra:
+            extra = '\n\n' + comment + ' ' + extra.rstrip().replace('#', comment).replace('\n', '\n' + comment + ' ')
+        else:
+            extra = ''
+        msg = body.rstrip() + extra
+        if title:
+            msg = title + '\n\n' + msg
         if self.git('rev-parse'):
             temp_file = os.path.join(self.gitm('rev-parse', '--git-dir').stdout.strip(), filename)
         else:
@@ -239,7 +347,7 @@ Options:
         with open(temp_file) as fd:
             msg = try_decode(fd.read())
         os.unlink(temp_file)
-        msg = re.compile('^#.*(:?\n|$)', re.MULTILINE).sub('', msg).strip()
+        msg = re.compile('^' + re.escape(comment) + '.*(:?\n|$)', re.MULTILINE).sub('', msg).strip()
         if not split_title:
             return msg
         title, body = (msg + '\n').split('\n', 1)
@@ -251,7 +359,7 @@ Options:
         msg = "%s\n\n%s" % (title, body)
         fd, temp_file = tempfile.mkstemp(prefix=filename)
         with os.fdopen(fd,'w') as fd:
-            fd.write(msg.encode('utf-8'))
+            fd.write(msg)
         return temp_file
 
     def repo_root(self):
@@ -271,21 +379,39 @@ Options:
         path = path.replace(root, '')
         return path
 
-    def set_tracking_branches(self, remote, upstream=None, triangular=False):
+    def set_tracking_branches(self, remote, upstream=None, triangular=False, upstream_branch=None):
+        if triangular and upstream:
+            pushremote = remote
+            pullremote = upstream
+            self.gitm('config', 'remote.pushDefault', pushremote)
+        else:
+            pushremote = None
+            pullremote = remote
+            upstream_branch = None
+
         for branch in self.git('for-each-ref', 'refs/heads/**').stdout.strip().splitlines():
             branch = branch.split(None, 2)[-1][11:]
-            if triangular and upstream:
-                pushremote = remote
-                pullremote = upstream
+
+            if upstream_branch and self.git('for-each-ref', 'refs/remotes/%s/%s' % (pullremote, upstream_branch)).stdout.strip():
+                tracking_remote = pullremote
+                tracking_branch = upstream_branch
+            elif self.git('for-each-ref', 'refs/remotes/%s/%s' % (pullremote, branch)).stdout.strip():
+                tracking_remote = pullremote
+                tracking_branch = branch
+            elif pushremote and self.git('for-each-ref', 'refs/remotes/%s/%s' % (pushremote, branch)).stdout.strip():
+                tracking_remote = pushremote
+                tracking_branch = branch
             else:
-                pushremote = None
-                pullremote = remote
-            if pullremote and self.git('for-each-ref', 'refs/remotes/%s/%s' % (pullremote, branch)).stdout.strip():
+                tracking_remote = None
+                tracking_branch = None
+
+            if tracking_remote and tracking_branch:
                 current = self.git('config', 'branch.%s.remote' % branch).stdout.strip()
                 if current in [remote, upstream, '']:
-                    print("Configuring branch %s to track remote %s" % (branch, pullremote))
-                    self.gitm('config', 'branch.%s.remote' % branch, pullremote)
-                    self.gitm('config', 'branch.%s.merge' % branch, 'refs/heads/%s' % branch)
+                    print("Configuring branch %s to track branch %s on remote %s" % (branch, tracking_branch, tracking_remote))
+                    self.gitm('config', 'branch.%s.remote' % branch, tracking_remote)
+                    self.gitm('config', 'branch.%s.merge' % branch, 'refs/heads/%s' % tracking_branch)
+
             if pushremote and self.git('for-each-ref', 'refs/remotes/%s/%s' % (pushremote, branch)).stdout.strip():
                 current = self.git('config', 'branch.%s.pushremote' % branch).stdout.strip()
                 if current in [remote, upstream, '']:
@@ -306,7 +432,7 @@ Options:
             self.hosts.append(host)
 
         # Which account do we use?
-        # 1: Explicitely configured
+        # 1: Explicitly configured
         self.account = opts['--account'] or os.environ.get('GITSPINDLE_ACCOUNT', None)
         if self.account and not self.config('user') and not opts['config']:
             err("%s does not yet know about %s. Use %s add-account to configure it" % (self.prog, self.account, self.prog))
@@ -327,6 +453,9 @@ Options:
         os.environ['GITSPINDLE_ACCOUNT'] = self.account or self.spindle
         host = self.config('host')
         if host:
+            if '://' not in host and ':' in host:
+                # SSH host, transform to ssh:// syntax
+                host = 'ssh://' + host.replace(':', '/')
             self.hosts = [urlparse.urlparse(host).hostname]
 
         for command, func in self.commands.items():
@@ -424,6 +553,19 @@ Options:
                             print(repo)
                             if not repo.delete():
                                 raise RuntimeError("Deleting repository failed")
+                # it needs some time until the /user/repos endpoint recognized that the repos are deleted
+                # this is a bug GitHub is working on to get a fix, maybe some caching issue on their side
+                # so this code might be removed in the future
+                # wait for the deletions to be recognized, or the test assertions might fail later on
+                tries = 120/5
+                clean = False
+                while tries and not clean:
+                    clean = namespace not in [x.owner.login for x in self.gh.iter_repos()]
+                    if not clean:
+                        tries -= 1
+                        time.sleep(5)
+                if not clean:
+                    raise RuntimeError("Deleting repositories failed, try again in some minutes or increase the wait timeout in test_cleanup")
             if opts['--gists']:
                 for gist in self.gh.iter_gists():
                     gist.delete()
@@ -512,3 +654,21 @@ class Credential(object):
             if key not in self.params:
                 raise ValueError("Unexpected data: %s=%s" % (key, val))
             setattr(self, key, val)
+
+# The main entrypoints
+def hub():
+    from gitspindle.github import GitHub
+    GitHub().main()
+
+def lab():
+    from gitspindle.gitlab import GitLab
+    GitLab().main()
+
+def bucket():
+    from gitspindle.bitbucket import BitBucket
+    BitBucket().main()
+
+def bb():
+    from gitspindle.bitbucket import BitBucket
+    BitBucket.prog = 'git bb'
+    BitBucket().main()

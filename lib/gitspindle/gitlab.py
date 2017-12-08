@@ -32,6 +32,10 @@ class GitLab(GitSpindle):
         self.gl = None
         host = self.config('host') or 'https://gitlab.com'
         if not host.startswith(('http://', 'https://')):
+            try:
+                requests.get('https://' + host)
+            except:
+                err("%s is not reachable via https. Use http://%s to use the insecure http protocol" % (host, host))
             host = 'https://' + host
         self.host = host
 
@@ -127,10 +131,6 @@ class GitLab(GitSpindle):
     def profile_url(self, user):
         return '%s/u/%s' % (self.host, user.username)
 
-    def issue_url(self, issue):
-        repo = self.gl.Project(issue.project_id)
-        return '%s/issues/%d' % (repo.web_url, issue.iid)
-
     def merge_url(self, merge):
         repo = self.gl.Project(merge.project_id)
         return '%s/merge_requests/%d' % (repo.web_url, merge.iid)
@@ -195,7 +195,7 @@ class GitLab(GitSpindle):
 
     @command
     def apply_merge(self, opts):
-        """<merge-request-number>
+        """[--ssh|--http] <merge-request-number>
            Applies a merge request as a series of cherry-picks"""
         repo = self.repository(opts)
         mn = int(opts['<merge-request-number>'])
@@ -224,7 +224,7 @@ class GitLab(GitSpindle):
         sha = self.git('rev-parse', '--verify', 'refs/merge/%d/head' % mr.iid).stdout.strip()
         if not sha:
             print("Fetching merge request")
-            url = glapi.Project(self.gl, mr.source_project_id).http_url_to_repo
+            url = self.clone_url(glapi.Project(self.gl, mr.source_project_id), opts)
             self.gitm('fetch', url, 'refs/heads/%s:refs/merge/%d/head' % (mr.source_branch, mr.iid), redirect=False)
         head_sha = self.gitm('rev-parse', 'HEAD').stdout.strip()
         if self.git('merge-base', 'refs/merge/%d/head' % mr.iid, head_sha).stdout.strip() == head_sha:
@@ -259,19 +259,19 @@ class GitLab(GitSpindle):
         months = []
         rows = [[],[],[],[],[],[],[]]
         commits = []
+        data = user.calendar()
 
-        data = requests.get(user.web_url + '/calendar').text
-        data = data[data.find('<script>')+8:data.find('</script>')]
-        data = data[data.find('{')+1:data.find('}')].replace('"', '')
-        data = [(datetime.datetime.fromtimestamp(int(key)), int(value)) for (key,value) in [item.split(':') for item in data.split(',')]]
-
-        wd = (data[0][0].weekday()+1) % 7
+        first = datetime.datetime.today() - datetime.timedelta(365)
+        wd = (first.weekday()+1) % 7
         for i in range(wd):
             rows[i].append((None,None))
         if wd:
-            months.append(data[0][0].month)
-        for (date, count) in data:
+            months.append(first.month)
+        for back in range(364, -1, -1):
+            date = datetime.datetime.today() - datetime.timedelta(back)
+            ts = date.strftime('%Y-%m-%d')
             wd = (date.weekday()+1) % 7
+            count = data.get(ts, 0)
             rows[wd].append((date.day, count))
             if not wd:
                 months.append(date.month)
@@ -297,9 +297,13 @@ class GitLab(GitSpindle):
         # Print commits
         days = 'SMTWTFS'
         commits.sort()
-        p5  = commits[int(round(len(commits) * 0.95))]
-        p15 = commits[int(round(len(commits) * 0.85))]
-        p35 = commits[int(round(len(commits) * 0.65))]
+        print(commits)
+        if len(commits) < 2:
+            p5 = p15 = p35 = 0
+        else:
+            p5  = commits[min(int(round(len(commits) * 0.95)), len(commits)-1)]
+            p15 = commits[min(int(round(len(commits) * 0.85)), len(commits)-1)]
+            p35 = commits[min(int(round(len(commits) * 0.65)), len(commits)-1)]
         blob1 = b'\xe2\x96\xa0'.decode('utf-8')
         blob2 = b'\xe2\x97\xbc'.decode('utf-8')
         for rnum, row in enumerate(rows):
@@ -356,7 +360,7 @@ class GitLab(GitSpindle):
 
     @command
     def clone(self, opts, repo=None):
-        """[--ssh|--http] [--triangular] [--parent] [git-clone-options] <repo> [<dir>]
+        """[--ssh|--http] [--triangular [--upstream-branch=<branch>]] [--parent] [git-clone-options] <repo> [<dir>]
            Clone a repository by name"""
         if not repo:
             repo = self.repository(opts)
@@ -395,7 +399,22 @@ class GitLab(GitSpindle):
                 err("Group %s could not be found" % opts['--group'])
             kwargs['namespace_id'] = group.id
         repo = glapi.Project(self.gl, kwargs)
-        repo.save()
+        i = 0
+        success = False
+        while not success:
+            try:
+                repo.save()
+                success = True
+            except glapi.GitlabCreateError as gce:
+                i += 1
+                time.sleep(1)
+                if (gce.response_code != 400) \
+                        or (not isinstance(gce.error_message, dict)) \
+                        or (not 'base' in gce.error_message) \
+                        or (not isinstance(gce.error_message['base'], list)) \
+                        or (not 'The project is still being deleted. Please try again later.' in gce.error_message['base']) \
+                        or (i >= 120):
+                    raise
         if 'origin' in self.remotes():
             print("Remote 'origin' already exists, adding the GitLab repository as 'gitlab'")
             self.set_origin(opts, repo=repo, remote='gitlab')
@@ -422,7 +441,7 @@ class GitLab(GitSpindle):
 
     @command
     def fork(self, opts):
-        """[--ssh|--http] [--triangular] [<repo>]
+        """[--ssh|--http] [--triangular [--upstream-branch=<branch>]] [<repo>]
            Fork a repo and clone it"""
         do_clone = bool(opts['<repo>'])
         repo = self.repository(opts)
@@ -433,7 +452,24 @@ class GitLab(GitSpindle):
         if my_repo:
             err("Repository already exists")
 
-        my_fork = repo.fork()
+        i = 0
+        success = False
+        while not success:
+            try:
+                my_fork = repo.fork()
+                success = True
+            except glapi.GitlabForkError as gfe:
+                i += 1
+                time.sleep(1)
+                if (gfe.response_code != 409) \
+                        or (not isinstance(gfe.error_message, dict)) \
+                        or (not 'base' in gfe.error_message) \
+                        or (not isinstance(gfe.error_message['base'], list)) \
+                        or (not 'The project is still being deleted. Please try again later.' in gfe.error_message['base']) \
+                        or (i >= 120):
+                    raise
+
+        self.wait_for_repo(my_fork.owner.username, my_fork.name, opts)
 
         if do_clone:
             self.clone(opts, repo=my_fork)
@@ -447,29 +483,29 @@ class GitLab(GitSpindle):
         if opts['<repo>'] and opts['<repo>'].isdigit():
             # Let's assume it's an issue
             opts['<issue>'].insert(0, opts['<repo>'])
+            opts['<repo>'] = None
         repo = self.repository(opts)
-        # There's no way to fetch an issue by iid. Abuse search.
-        issues = repo.Issue()
-        for issue in opts['<issue>']:
-            issue = int(issue)
-            issue = [x for x in issues if x.iid == issue][0]
-            print(wrap(issue.title, attr.bright, attr.underline))
-            print(issue.description)
-            print(self.issue_url(issue))
+        for issue_no in opts['<issue>']:
+            issues = repo.Issue(iid=issue_no)
+            if len(issues):
+                issue = issues[0]
+                print(wrap(issue.title.encode(sys.stdout.encoding, errors='backslashreplace').decode(sys.stdout.encoding), attr.bright, attr.underline))
+                print(issue.description.encode(sys.stdout.encoding, errors='backslashreplace').decode(sys.stdout.encoding))
+                print(issue.web_url)
+            else:
+                print('No issue with id %s found in repository %s' % (issue_no, repo.path_with_namespace))
         if not opts['<issue>']:
-            body = """
-# Reporting an issue on %s/%s
-# Please describe the issue as clarly as possible. Lines starting with '#' will
-# be ignored, the first line will be used as title for the issue.
-#""" % (repo.namespace.path, repo.path)
-            title, body = self.edit_msg(body, 'ISSUE_EDITMSG')
+            extra = """Reporting an issue on %s/%s
+Please describe the issue as clearly as possible. Lines starting with '#' will
+be ignored, the first line will be used as title for the issue.""" % (repo.namespace.path, repo.path)
+            title, body = self.edit_msg(None, '', extra, 'ISSUE_EDITMSG')
             if not body:
                 err("Empty issue message")
 
             try:
                 issue = glapi.ProjectIssue(self.gl, {'project_id': repo.id, 'title': title, 'description': body})
                 issue.save()
-                print("Issue %d created %s" % (issue.iid, self.issue_url(issue)))
+                print("Issue %d created %s" % (issue.iid, issue.web_url))
             except:
                 filename = self.backup_message(title, body, 'issue-message-')
                 err("Failed to create an issue, the issue text has been saved in %s" % filename)
@@ -478,7 +514,10 @@ class GitLab(GitSpindle):
     def issues(self, opts):
         """[<repo>] [--parent] [<filter>...]
            List issues in a repository"""
-        if not opts['<repo>'] and not self.in_repo:
+        if opts['<repo>'] and '=' in opts['<repo>']:
+            opts['<filter>'].insert(0, opts['<repo>'])
+            opts['<repo>'] = None
+        if (not opts['<repo>'] and not self.in_repo) or opts['<repo>'] == '--':
             repos = list(self.gl.Project())
         else:
             repos = [self.repository(opts)]
@@ -493,11 +532,11 @@ class GitLab(GitSpindle):
             if issues:
                 print(wrap("Issues for %s/%s" % (repo.namespace.path, repo.path), attr.bright))
                 for issue in issues:
-                    print("[%d] %s %s" % (issue.iid, issue.title, self.issue_url(issue)))
+                    print("[%d] %s %s" % (issue.iid, issue.title.encode(sys.stdout.encoding, errors='backslashreplace').decode(sys.stdout.encoding), issue.web_url))
             if mergerequests:
                 print(wrap("Merge requests for %s/%s" % (repo.namespace.path, repo.path), attr.bright))
                 for mr in mergerequests:
-                    print("[%d] %s %s" % (mr.iid, mr.title, self.merge_url(mr)))
+                    print("[%d] %s %s" % (mr.iid, mr.title.encode(sys.stdout.encoding, errors='backslashreplace').decode(sys.stdout.encoding), self.merge_url(mr)))
 
     @command
     def log(self, opts):
@@ -590,6 +629,11 @@ class GitLab(GitSpindle):
             src = self.gitm('rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
         if not dst:
             dst = parent.default_branch
+            if tracking_branch.startswith('refs/remotes/'):
+                tracking_remote, tracking_branch = tracking.branch.split('/', 3)[-2:]
+                if tracking_branch != src or repo.remote != tracking_remote:
+                    # Interesting. We're not just tracking a branch in our clone!
+                    dst = tracking_branch
 
         if src == dst and parent == repo:
             err("Cannot file a merge request on the same branch")
@@ -602,7 +646,7 @@ class GitLab(GitSpindle):
         except glapi.GitlabGetError:
             srcb = None
             if self.question("Branch %s does not exist in your GitLab repo, shall I push?" % src):
-                self.gitm('push', repo.remote, src, redirect=False)
+                self.gitm('push', '-u', repo.remote, src, redirect=False)
             else:
                 err("Aborting")
         if srcb and srcb.commit.id != commit:
@@ -656,15 +700,13 @@ class GitLab(GitSpindle):
             title = title.title().replace('-', ' ')
             body = ""
 
-        body += """
-# Requesting a merge from %s/%s into %s/%s
-#
-# Please enter a message to accompany your merge request. Lines starting
-# with '#' will be ignored, and an empty message aborts the request.
-#""" % (repo.namespace.path, src, parent.namespace.path, dst)
-        body += "\n# " + try_decode(self.gitm('shortlog', '%s/%s..%s' % (remote, dst, src)).stdout).strip().replace('\n', '\n# ')
-        body += "\n#\n# " + try_decode(self.gitm('diff', '--stat', '%s^..%s' % (commits[0], commits[-1])).stdout).strip().replace('\n', '\n#')
-        title, body = self.edit_msg("%s\n\n%s" % (title,body), 'MERGE_REQUEST_EDIT_MSG')
+        extra = """Requesting a merge from %s/%s into %s/%s
+
+Please enter a message to accompany your merge request. Lines starting
+with '#' will be ignored, and an empty message aborts the request.""" % (repo.namespace.path, src, parent.namespace.path, dst)
+        body += "\n\n" + try_decode(self.gitm('shortlog', '%s/%s..%s' % (remote, dst, src)).stdout).strip()
+        body += "\n\n" + try_decode(self.gitm('diff', '--stat', '%s^..%s' % (commits[0], commits[-1])).stdout).strip()
+        title, body = self.edit_msg(title, body, extra, 'MERGE_REQUEST_EDIT_MSG')
         if not body and not accept_empty_body:
             err("No merge request message specified")
 
@@ -787,7 +829,7 @@ class GitLab(GitSpindle):
 
     @command
     def set_origin(self, opts, repo=None, remote='origin'):
-        """[--ssh|--http] [--triangular]
+        """[--ssh|--http] [--triangular [--upstream-branch=<branch>]]
            Set the remote 'origin' to gitlab.
            If this is a fork, set the remote 'upstream' to the parent"""
         if not repo:
@@ -822,7 +864,7 @@ class GitLab(GitSpindle):
         if remote != 'origin':
             return
 
-        self.set_tracking_branches(remote, upstream="upstream", triangular=opts['--triangular'])
+        self.set_tracking_branches(remote, upstream="upstream", triangular=opts['--triangular'], upstream_branch=opts['--upstream-branch'])
 
     @command
     def unprotect(self, opts):

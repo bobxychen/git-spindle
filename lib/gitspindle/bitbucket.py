@@ -120,7 +120,7 @@ class BitBucket(GitSpindle):
     @command
     @wants_parent
     def apply_pr(self, opts):
-        """<pr-number>
+        """[--ssh|--http] <pr-number>
            Applies a pull request as a series of cherry-picks"""
         repo = self.repository(opts)
         pr = repo.pull_request(opts['<pr-number>'])
@@ -148,7 +148,7 @@ class BitBucket(GitSpindle):
         sha = self.git('rev-parse', '--verify', 'refs/pull/%d/head' % pr.id).stdout.strip()
         if not sha.startswith(pr.source['commit']['hash']):
             print("Fetching pull request")
-            url = self.bb.repository(*pr.source['repository']['full_name'].split('/')).links['clone']['https']
+            url = self.clone_url(self.bb.repository(*pr.source['repository']['full_name'].split('/')), opts)
             self.gitm('fetch', url, 'refs/heads/%s:refs/pull/%d/head' % (pr.source['branch']['name'], pr.id), redirect=False)
         head_sha = self.gitm('rev-parse', 'HEAD').stdout.strip()
         if self.git('merge-base', pr.source['commit']['hash'], head_sha).stdout.strip() == head_sha:
@@ -197,7 +197,7 @@ class BitBucket(GitSpindle):
 
     @command
     def clone(self, opts, repo=None):
-        """[--ssh|--http] [--triangular] [--parent] [git-clone-options] <repo> [<dir>]
+        """[--ssh|--http] [--triangular [--upstream-branch=<branch>]] [--parent] [git-clone-options] <repo> [<dir>]
            Clone a repository by name"""
         if not repo:
             repo = self.repository(opts)
@@ -264,7 +264,7 @@ class BitBucket(GitSpindle):
 
     @command
     def fork(self, opts):
-        """[--ssh|--http] [--triangular] [<repo>]
+        """[--ssh|--http] [--triangular [--upstream-branch=<branch>]] [<repo>]
            Fork a repo and clone it"""
         do_clone = bool(opts['<repo>'])
         repo = self.repository(opts)
@@ -278,6 +278,7 @@ class BitBucket(GitSpindle):
             pass
 
         my_fork = repo.fork()
+        self.wait_for_repo(my_fork.owner['username'], my_fork.name, opts)
 
         if do_clone:
             self.clone(opts, repo=my_fork)
@@ -315,25 +316,31 @@ class BitBucket(GitSpindle):
         if opts['<repo>'] and opts['<repo>'].isdigit():
             # Let's assume it's an issue
             opts['<issue>'].insert(0, opts['<repo>'])
+            opts['<repo>'] = None
         repo = self.repository(opts)
-        for issue in opts['<issue>']:
-            issue = repo.issue(issue)
-            print(wrap(issue.title, attr.bright, attr.underline))
-            print(issue.content)
-            print(issue.html_url)
+        for issue_no in opts['<issue>']:
+            try:
+                issue = repo.issue(issue_no)
+                print(wrap(issue.title.encode(sys.stdout.encoding, errors='backslashreplace').decode(sys.stdout.encoding), attr.bright, attr.underline))
+                print(issue.content['raw'].encode(sys.stdout.encoding, errors='backslashreplace').decode(sys.stdout.encoding))
+                print(issue.html_url)
+            except bbapi.BitBucketError:
+                bbe = sys.exc_info()[1]
+                if bbe.args[0] == 'No Issue matches the given query.':
+                    print('No issue with id %s found in repository %s' % (issue_no, repo.full_name))
+                else:
+                    raise
         if not opts['<issue>']:
-            body = """
-# Reporting an issue on %s/%s
-# Please describe the issue as clarly as possible. Lines starting with '#' will
-# be ignored, the first line will be used as title for the issue.
-#""" % (repo.owner['username'], repo.name)
-            title, body = self.edit_msg(body, 'ISSUE_EDITMSG')
+            extra = """Reporting an issue on %s/%s
+Please describe the issue as clearly as possible. Lines starting with '#' will
+be ignored, the first line will be used as title for the issue.""" % (repo.owner['username'], repo.name)
+            title, body = self.edit_msg(None, '', extra, 'ISSUE_EDITMSG')
             if not body:
                 err("Empty issue message")
 
             try:
                 issue = repo.create_issue(title=title, body=body)
-                print("Issue %d created %s" % (issue.local_id, issue.html_url))
+                print("Issue %d created %s" % (issue.id, issue.html_url))
             except:
                 filename = self.backup_message(title, body, 'issue-message-')
                 err("Failed to create an issue, the issue text has been saved in %s" % filename)
@@ -342,7 +349,10 @@ class BitBucket(GitSpindle):
     def issues(self, opts):
         """[<repo>] [--parent] [<filter>...]
            List issues in a repository"""
-        if not opts['<repo>'] and not self.in_repo:
+        if opts['<repo>'] and '=' in opts['<repo>']:
+            opts['<filter>'].insert(0, opts['<repo>'])
+            opts['<repo>'] = None
+        if (not opts['<repo>'] and not self.in_repo) or opts['<repo>'] == '--':
             repos = self.me.repositories()
         else:
             repos = [self.repository(opts)]
@@ -362,11 +372,11 @@ class BitBucket(GitSpindle):
             if issues:
                 print(wrap("Issues for %s" % repo.full_name, attr.bright))
                 for issue in issues:
-                    print("[%d] %s https://bitbucket.org/%s/issue/%d/" % (issue.local_id, issue.title, repo.full_name, issue.local_id))
+                    print("[%d] %s %s" % (issue.id, issue.title.encode(sys.stdout.encoding, errors='backslashreplace').decode(sys.stdout.encoding), issue.html_url))
             if pullrequests:
                 print(wrap("Pull requests for %s" % repo.full_name, attr.bright))
                 for pr in pullrequests:
-                    print("[%d] %s https://bitbucket.org/%s/pull-requests/%d/" % (pr.id, pr.title, repo.full_name, pr.id))
+                    print("[%d] %s %s" % (pr.id, pr.title.encode(sys.stdout.encoding, errors='backslashreplace').decode(sys.stdout.encoding), pr.html_url))
 
 
     @command
@@ -482,6 +492,11 @@ class BitBucket(GitSpindle):
             src = self.gitm('rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
         if not dst:
             dst = parent.main_branch()
+            if tracking_branch.startswith('refs/remotes/'):
+                tracking_remote, tracking_branch = tracking.branch.split('/', 3)[-2:]
+                if tracking_branch != src or repo.remote != tracking_remote:
+                    # Interesting. We're not just tracking a branch in our clone!
+                    dst = tracking_branch
 
         if src == dst and parent == repo:
             err("Cannot file a pull request on the same branch")
@@ -492,7 +507,7 @@ class BitBucket(GitSpindle):
         srcb = repo.branches().get(src, None)
         if not srcb:
             if self.question("Branch %s does not exist in your BitBucket repo, shall I push?" % src):
-                self.gitm('push', repo.remote, src, redirect=False)
+                self.gitm('push', '-u', repo.remote, src, redirect=False)
                 srcb = repo.branches().get(src, None)
             else:
                 err("Aborting")
@@ -548,15 +563,13 @@ class BitBucket(GitSpindle):
             title = title.title().replace('-', ' ')
             body = ""
 
-        body += """
-# Requesting a pull from %s/%s into %s/%s
-#
-# Please enter a message to accompany your pull request. Lines starting
-# with '#' will be ignored, and an empty message aborts the request.
-#""" % (repo.owner['username'], src, parent.owner['username'], dst)
-        body += "\n# " + try_decode(self.gitm('shortlog', '%s/%s..%s' % (remote, dst, src)).stdout).strip().replace('\n', '\n# ')
-        body += "\n#\n# " + try_decode(self.gitm('diff', '--stat', '%s^..%s' % (commits[0], commits[-1])).stdout).strip().replace('\n', '\n#')
-        title, body = self.edit_msg("%s\n\n%s" % (title,body), 'PULL_REQUEST_EDIT_MSG')
+        extra = """Requesting a pull from %s/%s into %s/%s
+
+Please enter a message to accompany your pull request. Lines starting
+with '#' will be ignored, and an empty message aborts the request.""" % (repo.owner['username'], src, parent.owner['username'], dst)
+        extra += "\n\n" + try_decode(self.gitm('shortlog', '%s/%s..%s' % (remote, dst, src)).stdout).strip()
+        extra += "\n\n" + try_decode(self.gitm('diff', '--stat', '%s^..%s' % (commits[0], commits[-1])).stdout).strip()
+        title, body = self.edit_msg(title, body, extra, 'PULL_REQUEST_EDIT_MSG')
         if not body and not accept_empty_body:
             err("No pull request message specified")
 
@@ -608,7 +621,7 @@ class BitBucket(GitSpindle):
 
     @command
     def set_origin(self, opts, repo=None, remote='origin'):
-        """[--ssh|--http] [--triangular]
+        """[--ssh|--http] [--triangular [--upstream-branch=<branch>]]
            Set the remote 'origin' to github.
            If this is a fork, set the remote 'upstream' to the parent"""
         if not repo:
@@ -642,7 +655,7 @@ class BitBucket(GitSpindle):
         if remote != 'origin':
             return
 
-        self.set_tracking_branches(remote, upstream="upstream", triangular=opts['--triangular'])
+        self.set_tracking_branches(remote, upstream="upstream", triangular=opts['--triangular'], upstream_branch=opts['--upstream-branch'])
 
     @command
     def snippet(self, opts):
